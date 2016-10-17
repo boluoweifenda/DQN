@@ -1,0 +1,53 @@
+import cv2
+import numpy as np
+class Environment:
+    def __init__(self,opt):
+        self.envType = opt.environment
+        self.show = opt.show
+        self.delay = opt.delay
+        self.width = opt.width
+        self.height = opt.height
+        self.noopMax = opt.noopMax
+
+        if self.show is True:
+            cv2.namedWindow("show")
+        if self.envType == "ALE":
+            import ale_python_interface
+            self.env = ale_python_interface.ALEInterface()
+            if opt.randomSeed == None:
+                self.env.setInt('random_seed', 0)
+            else:
+                self.env.setInt('random_seed', opt.randomSeed)
+            self.env.setInt("frame_skip", opt.frameSkip)
+            self.env.setBool('color_averaging', opt.colorAverageing)
+            self.env.setInt('phosphor_blend_ratio', opt.phosphorBlendRatio)
+            self.env.setInt('max_num_frames_per_episode', opt.maxNumFramesPerEpisode)
+            # print self.env.getInt('phosphor_blend_ratio')
+            self.env.setBool('sound', False)
+            self.env.setBool('display_screen', False)
+            self.env.setFloat("repeat_action_probability", 0.0)
+            self.env.loadROM(opt.pathRom)
+            self.legal_actions = self.env.getMinimalActionSet()
+            self.n_actions = len(self.legal_actions)
+
+
+    def reset(self):
+        self.env.reset_game()
+    def act(self,actionIndex):
+        return self.env.act(self.legal_actions[actionIndex])
+
+    def observe(self):
+        if self.show is True:
+            cv2.imshow("show", cv2.cvtColor(self.env.getScreenRGB(),cv2.COLOR_RGB2BGR))
+            cv2.waitKey(self.delay)
+        return cv2.resize(self.env.getScreenGrayscale(), (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+            # return (cv2.resize(cv2.cvtColor(self.env.getScreenRGB(),cv2.COLOR_BGR2YUV)[:,:,0], (self.width, self.height) , interpolation=cv2.INTER_LINEAR)) #/ np.float32(255)
+
+    def getLives(self):
+        return self.env.lives()
+    def terminal(self):
+        return self.env.game_over()
+
+    def noop(self):
+        for _ in xrange(np.random.randint(28,self.noopMax)+1):
+            self.env.act(0)

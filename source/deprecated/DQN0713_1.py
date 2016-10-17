@@ -1,0 +1,308 @@
+import sys
+import numpy as np
+import cv2
+from random import randrange
+from ale_python_interface import ALEInterface
+import time
+import tensorflow as tf
+import myLog
+import math
+import gym
+
+from collections import deque
+
+MYTIMEFORMAT = '%Y-%m-%d %X'
+
+logPath = "log/DQNtemp.txt"
+modelPath = "model/"
+dataPath = "data/"
+frameSkip = 4
+initialExplorationRate = 1.0
+finalExplorationRate = 0.1
+loadModel = -1
+loadModelPath = "model/" + "%02d" % loadModel + ".tfmodel"
+saveData = False
+saveModel = True
+gamma = .99
+learning_rate = 0.00025
+
+display_screen = False
+
+batchSize = 32
+
+ale = ALEInterface()
+ale.setInt('random_seed', 123)
+ale.setInt("frame_skip", frameSkip)
+USE_SDL = True
+if USE_SDL:
+    if sys.platform == 'darwin':
+        import pygame
+
+        pygame.init()
+        ale.setBool('sound', False)  # Sound doesn't work on OSX
+    elif sys.platform.startswith('linux'):
+        ale.setBool('sound', False)
+    ale.setBool('display_screen', display_screen)
+
+ale.loadROM("rom/Breakout.A26")
+legal_actions = ale.getMinimalActionSet()
+
+n_senses = 82 * 72
+n_actions = len(legal_actions)
+temporal_window = 1
+hiddenSize1 = 256
+hiddenSize2 = 32
+network_size = n_senses * (temporal_window) + n_actions * (temporal_window - 1)
+memorySize = 1000000
+maxEpisode = 1000000
+maxFrame = 50000000
+frameCount = 0
+
+startLearningFrame = 10000
+explorationRate = 1.0
+finalExplorationFrame = 20000
+explorationRateDelta = (initialExplorationRate - finalExplorationRate) / (finalExplorationFrame - startLearningFrame)
+targetUpdateFrame = 10000
+
+
+class convNet():
+    def __init__(self):
+        self.z = tf.placeholder(dtype=tf.float32, shape=[None, n_actions])
+        self.action = tf.placeholder(dtype=tf.uint8, shape=[None, 1])
+        # global_step = tf.Variable(0, trainable=False)
+
+        self.x = tf.placeholder(dtype=tf.float32, shape=[None, network_size])
+        self.x_image = tf.reshape(self.x, [-1, 82, 72, 1])
+
+        self.W_conv1 = tf.Variable(tf.truncated_normal([8, 8, 1, 32], mean=0.0, stddev=0.01), dtype=tf.float32)
+        self.b_conv1 = tf.Variable(tf.constant(0.01, dtype=tf.float32, shape=[32]))
+        self.h_conv1 = tf.nn.relu(
+            tf.nn.conv2d(self.x_image, self.W_conv1, strides=[1, 4, 4, 1], padding='SAME') + self.b_conv1)
+
+        self.W_conv2 = tf.Variable(tf.truncated_normal(([4, 4, 32, 64]), mean=0.0, stddev=0.01, dtype=tf.float32))
+        self.b_conv2 = tf.Variable(tf.constant(0.01, dtype=tf.float32, shape=[64]))
+        self.h_conv2 = tf.nn.relu(
+            tf.nn.conv2d(self.h_conv1, self.W_conv2, strides=[1, 2, 2, 1], padding='SAME') + self.b_conv2)
+
+        self.W_conv3 = tf.Variable(tf.truncated_normal(([3, 3, 64, 64]), mean=0.0, stddev=0.01, dtype=tf.float32))
+        self.b_conv3 = tf.Variable(tf.constant(0.01, dtype=tf.float32, shape=[64]))
+        self.h_conv3 = tf.nn.relu(
+            tf.nn.conv2d(self.h_conv2, self.W_conv3, strides=[1, 1, 1, 1], padding='SAME') + self.b_conv3)
+
+        self.h_conv3_flat = tf.reshape(self.h_conv3, [-1, 11 * 9 * 64])
+        self.W_fc1 = tf.Variable(tf.truncated_normal(([11 * 9 * 64, 512]), mean=0.0, stddev=0.01, dtype=tf.float32))
+        self.b_fc1 = tf.Variable(tf.constant(0.01, dtype=tf.float32, shape=[512]))
+        self.h_fc1 = tf.nn.relu(tf.matmul(self.h_conv3_flat, self.W_fc1) + self.b_fc1)
+
+        self.W_fc2 = tf.Variable(tf.truncated_normal(([512, n_actions]), mean=0.0, stddev=0.01, dtype=tf.float32))
+        self.b_fc2 = tf.Variable(tf.constant(0.01, dtype=tf.float32, shape=[n_actions]))
+        self.y = tf.matmul(self.h_fc1, self.W_fc2) + self.b_fc2
+
+        self.cost = tf.reduce_mean(tf.reduce_sum(tf.square(self.z - self.y), reduction_indices=[1]))
+
+        # learning_rate = tf.train.exponential_decay(starter_learning_rate, global_step, decay_steps, decay_rate, staircase)
+        # learning_step = (tf.train.GradientDescentOptimizer(learning_rate).minimize(cost, global_step=global_step))
+        # self.learning_step = tf.train.GradientDescentOptimizer(learning_rate).minimize(self.cost)
+        self.learning_step = tf.train.RMSPropOptimizer(learning_rate, decay=0.9, momentum=0.0, epsilon=1e-10).minimize(
+            self.cost)
+
+        # def
+
+
+with tf.device('/gpu:3'):
+    with tf.variable_scope("train") as train_scope:
+        Q_train = convNet()
+    # with tf.device('/gpu:2'):
+    with tf.variable_scope("target") as target_scope:
+        Q_target = convNet()
+
+        # with tf.variable_scope('optimizer'):
+        #     reward = tf.placeholder(tf.uint8, [None])
+        #     action = tf.placeholder(tf.uint8, [None])
+        #
+        #     action_one_hot = tf.one_hot(action, n_actions, 1.0, 0.0)
+        #     Q_train_y_acted = tf.reduce_sum(Q_train.y * action_one_hot, reduction_indices=1)
+        #
+        #     delta = reward + gamma*np.amax(Q_target.y, axis=1) - Q_train_y_acted
+        #     clipped_delta = tf.clip_by_value(delta, -1., +1., )
+        #
+        #     loss = tf.reduce_mean(tf.square(clipped_delta), name='loss')
+        #
+        #     optim = tf.train.RMSPropOptimizer( learning_rate=0.00025, momentum=0.95, epsilon=0.01).minimize(loss)
+
+sess = tf.InteractiveSession()  # config=tf.ConfigProto(log_device_placement=True))
+sess.run(tf.initialize_all_variables())
+
+saver = tf.train.Saver(max_to_keep=None)
+if loadModel is not -1:
+    saver.restore(sess, loadModelPath)
+
+
+def forward(input, net, all=False):
+    actionValues = sess.run(net.y, feed_dict={net.x: input})
+    if all is True:
+        return actionValues
+    actionValue_max = np.max(actionValues)
+    index = np.argmax(actionValues, axis=1)
+    return [index, actionValue_max]
+
+
+def Scale(img):
+    imgResize = img.reshape([210, 160], order=0)[32:196, 8:152]
+    imgScale = (cv2.resize(imgResize, (72, 82), interpolation=cv2.INTER_NEAREST)) > 0
+    imgScale.dtype = 'uint8'
+    return imgScale.reshape([5904], order=0)
+
+
+log = myLog.Log(logPath, 'w+')
+
+print time.strftime(MYTIMEFORMAT, time.localtime())
+print 'simulation start!'
+
+memory = np.zeros([memorySize, n_senses + 1 + 1], dtype='uint8')
+memoryCount = 0
+
+# memory = deque(maxlen=memorySize)
+
+State0 = np.zeros([batchSize, network_size])
+State1 = np.zeros([batchSize, network_size])
+Action0 = np.zeros([batchSize])
+Reward0 = np.zeros([batchSize])
+
+episode = 0
+
+cv2.namedWindow("ImageGray")
+env = gym.make('Breakout-v0')
+env.reset()
+t = env.action_space
+for _ in range(10000):
+    ttt = env.action_space.sample()
+    observation, reward, done, info = env.step(ttt)
+    cv2.imshow("ImageGray", observation)
+    cv2.waitKey(10)
+
+while frameCount is not maxFrame:
+
+    ale.reset_game()
+    score = 0
+    cost_average = 0.0
+    frameCountLast = frameCount
+    t0 = time.time()
+    t1s = t2s = t3s = t4s = t5s = t6s = t7s = t8s = t9s = 0
+    while not ale.game_over():
+
+        t00 = time.time()
+
+        imgBinary = Scale(ale.getScreen())
+
+        t1 = time.time()
+        t1s += t1 - t00
+
+        if np.random.rand(1) > explorationRate:
+            [actionIndex, actionValue] = forward([imgBinary], Q_train, all=False)
+        else:
+            actionIndex = randrange(len(legal_actions))  # get action
+
+        t2 = time.time()
+        t2s += t2 - t1
+
+        reward = ale.act(legal_actions[actionIndex])  # reward
+
+        t3 = time.time()
+        t3s += t3 - t2
+
+        memory[memoryCount, 0:n_senses] = imgBinary
+        memory[memoryCount, n_senses] = actionIndex
+        memory[memoryCount, n_senses + 1] = reward
+
+        score += reward
+
+        t4 = time.time()
+        t4s += t4 - t3
+
+        # training
+        if frameCount >= startLearningFrame - 1:
+            index = np.random.randint(0, (memorySize if frameCount >= memorySize else frameCount), batchSize)
+
+            t5 = time.time()
+            t5s += t5 - t4
+
+            State0 = memory[index, 0:n_senses]
+            State1 = memory[index + 1, 0:n_senses]
+            Action0 = memory[index, n_senses]
+            Reward0 = memory[index, n_senses + 1]
+
+            t6 = time.time()
+            t6s += t6 - t5
+
+            Z = sess.run(Q_train.y, feed_dict={Q_train.x: State0})
+
+            Value1 = sess.run(Q_target.y, feed_dict={Q_target.x: State1})
+
+            t7 = time.time()
+            t7s += t7 - t6
+
+            Reward1Max = np.amax(Value1, axis=1)
+            updataR = Reward0 + gamma * Reward1Max
+            for i in xrange(batchSize):
+                cost_average += (Z[i, int(Action0[i])] - updataR[i]) ** 2
+                Z[i, int(Action0[i])] = updataR[i]
+
+            t8 = time.time()
+            t8s += t8 - t7
+
+            sess.run(Q_train.learning_step, feed_dict={Q_train.x: State0, Q_train.z: Z})
+
+            t9 = time.time()
+            t9s += t9 - t8
+
+            if explorationRate > 0.1:
+                explorationRate -= explorationRateDelta
+
+            if frameCount % targetUpdateFrame is 0:
+                sess.run(Q_target.W_conv1.assign(Q_train.W_conv1))
+                sess.run(Q_target.W_conv2.assign(Q_train.W_conv2))
+                sess.run(Q_target.W_conv3.assign(Q_train.W_conv3))
+                sess.run(Q_target.W_fc1.assign(Q_train.W_fc1))
+                sess.run(Q_target.W_fc2.assign(Q_train.W_fc2))
+                sess.run(Q_target.W_conv3.assign(Q_train.W_conv3))
+                sess.run(Q_target.b_conv1.assign(Q_train.b_conv1))
+                sess.run(Q_target.b_conv2.assign(Q_train.b_conv2))
+                sess.run(Q_target.b_conv3.assign(Q_train.b_conv3))
+                sess.run(Q_target.b_fc1.assign(Q_train.b_fc1))
+                sess.run(Q_target.b_fc2.assign(Q_train.b_fc2))
+
+                if saveModel is True:
+                    saver.save(sess, modelPath + '%08d' % (frameCount) + '.tfmodel')
+
+        frameCount += 1
+        memoryCount += 1
+        if frameCount is startLearningFrame:
+            explorationRate = 1.0
+        if memoryCount == memorySize:
+            memoryCount = 0
+        if frameCount is maxFrame:
+            break
+
+    cost_average /= (1.0 * batchSize * (frameCount - frameCountLast))
+    episode += 1
+    print 'Episode: %05d Score: %03d Exploration: %.2f Frame: %08d Cost: %.9f %.2f frames/sec  ' \
+          % (
+          episode, score, explorationRate, frameCount, cost_average, (frameCount - frameCountLast) / (time.time() - t0))
+
+    if frameCount > startLearningFrame:
+        print t1s, t2s, t3s, t4s, t5s, t6s, t7s, t8s, t9s
+
+print 'simulation end!'
+print time.strftime(MYTIMEFORMAT, time.localtime())
+
+
+
+
+
+
+
+
+
+
+
